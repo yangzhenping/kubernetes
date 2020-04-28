@@ -26,6 +26,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2019-06-01/network"
 	"github.com/Azure/go-autorest/autorest"
@@ -33,10 +34,132 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 
+	"k8s.io/client-go/util/flowcontrol"
 	azclients "k8s.io/legacy-cloud-providers/azure/clients"
 	"k8s.io/legacy-cloud-providers/azure/clients/armclient"
 	"k8s.io/legacy-cloud-providers/azure/clients/armclient/mockarmclient"
+	"k8s.io/legacy-cloud-providers/azure/retry"
 )
+
+func TestNew(t *testing.T) {
+	config := &azclients.ClientConfig{
+		SubscriptionID:          "sub",
+		ResourceManagerEndpoint: "endpoint",
+		Location:                "eastus",
+		RateLimitConfig: &azclients.RateLimitConfig{
+			CloudProviderRateLimit:            true,
+			CloudProviderRateLimitQPS:         0.5,
+			CloudProviderRateLimitBucket:      1,
+			CloudProviderRateLimitQPSWrite:    0.5,
+			CloudProviderRateLimitBucketWrite: 1,
+		},
+		Backoff: &retry.Backoff{Steps: 1},
+	}
+
+	nsgClient := New(config)
+	assert.Equal(t, "sub", nsgClient.subscriptionID)
+	assert.NotEmpty(t, nsgClient.rateLimiterReader)
+	assert.NotEmpty(t, nsgClient.rateLimiterWriter)
+}
+
+func TestGet(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	resourceID := "/subscriptions/subscriptionID/resourceGroups/rg/providers/Microsoft.Network/networkSecurityGroups/nsg1"
+	response := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       ioutil.NopCloser(bytes.NewReader([]byte("{}"))),
+	}
+
+	armClient := mockarmclient.NewMockInterface(ctrl)
+	armClient.EXPECT().GetResource(gomock.Any(), resourceID, "").Return(response, nil).Times(1)
+	armClient.EXPECT().CloseResponse(gomock.Any(), gomock.Any()).Times(1)
+
+	nsgClient := getTestSecurityGroupClient(armClient)
+	result, rerr := nsgClient.Get(context.TODO(), "rg", "nsg1", "")
+	assert.NotNil(t, result)
+	assert.Nil(t, rerr)
+}
+
+func TestGetNeverRateLimiter(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	resourceID := "/subscriptions/subscriptionID/resourceGroups/rg/providers/Microsoft.Network/networkSecurityGroups/nsg1"
+	response := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Body:       ioutil.NopCloser(bytes.NewReader([]byte("{}"))),
+	}
+	nsgGetErr := &retry.Error{
+		HTTPStatusCode: http.StatusTooManyRequests,
+		RawError:       fmt.Errorf("azure cloud provider rate limited(%s) for operation %q", "read", "NSGGet"),
+		Retriable:      true,
+	}
+
+	armClient := mockarmclient.NewMockInterface(ctrl)
+	armClient.EXPECT().GetResource(gomock.Any(), resourceID, "").Return(response, nsgGetErr).Times(1)
+	armClient.EXPECT().CloseResponse(gomock.Any(), gomock.Any()).Times(1)
+
+	nsgClient := getTestSecurityGroupClientWithNeverRateLimiter(armClient)
+	expected := network.SecurityGroup{}
+	result, rerr := nsgClient.Get(context.TODO(), "rg", "nsg1", "")
+	assert.Equal(t, expected, result)
+	assert.NotNil(t, rerr)
+	//assert.Equal(t, nsgGetErr, rerr)
+}
+
+func TestGetRetryAfterReader(t *testing.T) {
+        ctrl := gomock.NewController(t)
+        defer ctrl.Finish()
+
+        resourceID := "/subscriptions/subscriptionID/resourceGroups/rg/providers/Microsoft.Network/networkSecurityGroups/nsg1"
+        response := &http.Response{
+                StatusCode: http.StatusTooManyRequests,
+                Body:       ioutil.NopCloser(bytes.NewReader([]byte("{}"))),
+        }
+	nsgGetErr := &retry.Error{
+                HTTPStatusCode: http.StatusTooManyRequests,
+                RawError:       fmt.Errorf("azure cloud provider throttled for operation %s with reason %q","NSGGet", "client throttled"),
+                Retriable:      true,
+        }
+
+        armClient := mockarmclient.NewMockInterface(ctrl)
+        armClient.EXPECT().GetResource(gomock.Any(), resourceID, "").Return(response, nsgGetErr).Times(1)
+        armClient.EXPECT().CloseResponse(gomock.Any(), gomock.Any()).Times(1)
+
+        nsgClient := getTestSecurityGroupClientWithRetryAfterReader(armClient)
+        expected := network.SecurityGroup{}
+        result, rerr := nsgClient.Get(context.TODO(), "rg", "nsg1", "")
+        assert.Equal(t, expected, result)
+        assert.NotNil(t, rerr)
+	//assert.Equal(t, nsgGetErr, rerr)
+}
+
+func TestGetThrottle(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	resourceID := "/subscriptions/subscriptionID/resourceGroups/rg/providers/Microsoft.Network/networkSecurityGroups/nsg1"
+	response := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Body:       ioutil.NopCloser(bytes.NewReader([]byte("{}"))),
+	}
+	throttleErr := &retry.Error{
+		HTTPStatusCode: http.StatusTooManyRequests,
+		RawError:       fmt.Errorf("error"),
+		Retriable:      true,
+		RetryAfter:     time.Unix(100, 0),
+	}
+	armClient := mockarmclient.NewMockInterface(ctrl)
+	armClient.EXPECT().GetResource(gomock.Any(), resourceID, "").Return(response, throttleErr).Times(1)
+	armClient.EXPECT().CloseResponse(gomock.Any(), gomock.Any()).Times(1)
+
+	nsgClient := getTestSecurityGroupClient(armClient)
+	result, rerr := nsgClient.Get(context.TODO(), "rg", "nsg1", "")
+	assert.Empty(t, result)
+	assert.Equal(t, throttleErr, rerr)
+}
 
 func TestGetNotFound(t *testing.T) {
 	ctrl := gomock.NewController(t)
@@ -102,6 +225,89 @@ func TestList(t *testing.T) {
 	assert.Equal(t, 3, len(result))
 }
 
+func TestListNeverRateLimiter(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	resourceID := "/subscriptions/subscriptionID/resourceGroups/rg/providers/Microsoft.Network/networkSecurityGroups"
+	nsgList := []network.SecurityGroup{getTestSecurityGroup("nsg1"), getTestSecurityGroup("nsg2"), getTestSecurityGroup("nsg3")}
+	responseBody, err := json.Marshal(network.SecurityGroupListResult{Value: &nsgList})
+	assert.Nil(t, err)
+	nsgGetErr := &retry.Error{
+		HTTPStatusCode: http.StatusTooManyRequests,
+		RawError:       fmt.Errorf("azure cloud provider rate limited(%s) for operation %q", "read", "NSGList"),
+		Retriable:      true,
+	}
+
+	armClient := mockarmclient.NewMockInterface(ctrl)
+	armClient.EXPECT().GetResource(gomock.Any(), resourceID, "").Return(
+		&http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Body:       ioutil.NopCloser(bytes.NewReader(responseBody)),
+		}, nsgGetErr).Times(1)
+	armClient.EXPECT().CloseResponse(gomock.Any(), gomock.Any()).Times(1)
+
+	nsgClient := getTestSecurityGroupClientWithNeverRateLimiter(armClient)
+	expected := network.SecurityGroup{}
+	result, rerr := nsgClient.List(context.TODO(), "rg")
+	assert.Equal(t, expected, result)
+	assert.NotNil(t, rerr)
+	//assert.Equal(t, nsgGetErr, rerr)
+}
+
+func TestListRetryAfterReader(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	resourceID := "/subscriptions/subscriptionID/resourceGroups/rg/providers/Microsoft.Network/networkSecurityGroups"
+	response := &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Body:       ioutil.NopCloser(bytes.NewReader([]byte("{}"))),
+	}
+	nsgGetErr := &retry.Error{
+			HTTPStatusCode: http.StatusTooManyRequests,
+			RawError:       fmt.Errorf("azure cloud provider throttled for operation %s with reason %q","NSGList", "client throttled"),
+			Retriable:      true,
+	}
+
+	armClient := mockarmclient.NewMockInterface(ctrl)
+	armClient.EXPECT().GetResource(gomock.Any(), resourceID, "").Return(response, nsgGetErr).Times(1)
+	armClient.EXPECT().CloseResponse(gomock.Any(), gomock.Any()).Times(1)
+
+	nsgClient := getTestSecurityGroupClientWithRetryAfterReader(armClient)
+	expected := network.SecurityGroup{}
+	result, rerr := nsgClient.List(context.TODO(), "rg")
+	assert.Equal(t, expected, result)
+	assert.NotNil(t, rerr)
+	//assert.Equal(t, nsgGetErr, rerr)
+}
+
+func TestListThrottle(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	resourceID := "/subscriptions/subscriptionID/resourceGroups/rg/providers/Microsoft.Network/networkSecurityGroups"
+	response := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Body:       ioutil.NopCloser(bytes.NewReader([]byte("{}"))),
+	}
+	throttleErr := &retry.Error{
+		HTTPStatusCode: http.StatusTooManyRequests,
+		RawError:       fmt.Errorf("error"),
+		Retriable:      true,
+		RetryAfter:     time.Unix(100, 0),
+	}
+	armClient := mockarmclient.NewMockInterface(ctrl)
+	armClient.EXPECT().GetResource(gomock.Any(), resourceID, "").Return(response, throttleErr).Times(1)
+	armClient.EXPECT().CloseResponse(gomock.Any(), gomock.Any()).Times(1)
+
+	nsgClient := getTestSecurityGroupClient(armClient)
+	result, rerr := nsgClient.List(context.TODO(), "rg")
+	assert.Empty(t, result)
+	assert.NotNil(t,rerr)
+	//assert.Equal(t, throttleErr, rerr)
+}
+
 func TestCreateOrUpdate(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -148,5 +354,28 @@ func getTestSecurityGroupClient(armClient armclient.Interface) *Client {
 		subscriptionID:    "subscriptionID",
 		rateLimiterReader: rateLimiterReader,
 		rateLimiterWriter: rateLimiterWriter,
+	}
+}
+
+func getTestSecurityGroupClientWithNeverRateLimiter(armClient armclient.Interface) *Client {
+	rateLimiterReader := flowcontrol.NewFakeNeverRateLimiter()
+	rateLimiterWriter := flowcontrol.NewFakeNeverRateLimiter()
+	return &Client{
+		armClient:         armClient,
+		subscriptionID:	   "subscriptionID",
+		rateLimiterReader: rateLimiterReader,
+		rateLimiterWriter: rateLimiterWriter,
+	}
+}
+
+func getTestSecurityGroupClientWithRetryAfterReader(armClient armclient.Interface) *Client {
+	rateLimiterReader := flowcontrol.NewFakeAlwaysRateLimiter()
+	rateLimiterWriter := flowcontrol.NewFakeAlwaysRateLimiter()
+	return &Client{
+		armClient:	   armClient,
+		subscriptionID:	   "subscriptionID",
+		rateLimiterReader: rateLimiterReader,
+		rateLimiterWriter: rateLimiterWriter,
+		RetryAfterReader:  time.Now().AddDate(1,0,0),
 	}
 }
